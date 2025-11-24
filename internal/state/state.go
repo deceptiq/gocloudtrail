@@ -10,12 +10,13 @@ import (
 
 const createTableSQL = `
 CREATE TABLE IF NOT EXISTS state (
+	bucket TEXT NOT NULL,
 	account_id TEXT NOT NULL,
 	region TEXT NOT NULL,
 	last_processed_key TEXT,
 	processed_count INTEGER DEFAULT 0,
 	last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-	PRIMARY KEY (account_id, region)
+	PRIMARY KEY (bucket, account_id, region)
 )`
 
 type DB struct {
@@ -43,11 +44,11 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
-func (d *DB) GetLastProcessedKey(accountID, region string) (string, error) {
+func (d *DB) GetLastProcessedKey(bucket, accountID, region string) (string, error) {
 	var lastKey sql.NullString
 	err := d.db.QueryRow(
-		"SELECT last_processed_key FROM state WHERE account_id = ? AND region = ?",
-		accountID, region,
+		"SELECT last_processed_key FROM state WHERE bucket = ? AND account_id = ? AND region = ?",
+		bucket, accountID, region,
 	).Scan(&lastKey)
 
 	if err == sql.ErrNoRows {
@@ -63,15 +64,15 @@ func (d *DB) GetLastProcessedKey(accountID, region string) (string, error) {
 	return "", nil
 }
 
-func (d *DB) UpdateLastProcessedKey(accountID, region, key string) error {
+func (d *DB) UpdateLastProcessedKey(bucket, accountID, region, key string) error {
 	_, err := d.db.Exec(`
-		INSERT INTO state (account_id, region, last_processed_key, processed_count, last_updated)
-		VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
-		ON CONFLICT(account_id, region) DO UPDATE SET
+		INSERT INTO state (bucket, account_id, region, last_processed_key, processed_count, last_updated)
+		VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+		ON CONFLICT(bucket, account_id, region) DO UPDATE SET
 			last_processed_key = excluded.last_processed_key,
 			processed_count = processed_count + 1,
 			last_updated = CURRENT_TIMESTAMP
-	`, accountID, region, key)
+	`, bucket, accountID, region, key)
 	if err != nil {
 		return fmt.Errorf("update state: %w", err)
 	}

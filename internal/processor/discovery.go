@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -71,68 +72,77 @@ func (p *Processor) discoverAccounts(ctx context.Context, bucket, basePrefix str
 	return accounts, orgID
 }
 
-// find all AWS regions that have CloudTrail logs
-func (p *Processor) discoverRegions(ctx context.Context, bucket, basePrefix string, accounts []string, orgID string) []string {
-	regionMap := make(map[string]bool)
+// AccountRegionPair represents an account/region combination that has data
+type AccountRegionPair struct {
+	AccountID string
+	Region    string
+}
 
+// discoverAccountRegions finds all account/region combinations that actually have CloudTrail logs
+func (p *Processor) discoverAccountRegions(ctx context.Context, bucket, basePrefix string, accounts []string, orgID string) []AccountRegionPair {
+	var pairs []AccountRegionPair
+	var mu sync.Mutex
+
+	var wg sync.WaitGroup
 	for _, accountID := range accounts {
-		var prefix string
-		if orgID != "" {
-			prefix = fmt.Sprintf("%s%s/%s/CloudTrail/", basePrefix, orgID, accountID)
-		} else {
-			prefix = fmt.Sprintf("%s%s/CloudTrail/", basePrefix, accountID)
-		}
+		wg.Add(1)
+		go func(acct string) {
+			defer wg.Done()
 
-		input := &s3.ListObjectsV2Input{
-			Bucket:    aws.String(bucket),
-			Prefix:    aws.String(prefix),
-			Delimiter: aws.String("/"),
-			MaxKeys:   aws.Int32(1000),
-		}
-
-		paginator := s3.NewListObjectsV2Paginator(p.s3Client, input)
-		for paginator.HasMorePages() {
-			page, err := paginator.NextPage(ctx)
-			if err != nil {
-				p.logger.Error("failed to discover regions",
-					slog.String("account", accountID),
-					slog.String("error", err.Error()))
-				break
+			var prefix string
+			if orgID != "" {
+				prefix = fmt.Sprintf("%s%s/%s/CloudTrail/", basePrefix, orgID, acct)
+			} else {
+				prefix = fmt.Sprintf("%s%s/CloudTrail/", basePrefix, acct)
 			}
 
-			for _, commonPrefix := range page.CommonPrefixes {
-				parts := strings.Split(aws.ToString(commonPrefix.Prefix), "/")
-				for i, part := range parts {
-					if part == "CloudTrail" && i+1 < len(parts) {
-						region := parts[i+1]
-						if region != "" {
-							regionMap[region] = true
+			input := &s3.ListObjectsV2Input{
+				Bucket:    aws.String(bucket),
+				Prefix:    aws.String(prefix),
+				Delimiter: aws.String("/"),
+				MaxKeys:   aws.Int32(1000),
+			}
+
+			paginator := s3.NewListObjectsV2Paginator(p.s3Client, input)
+			for paginator.HasMorePages() {
+				page, err := paginator.NextPage(ctx)
+				if err != nil {
+					p.logger.Error("failed to discover regions",
+						slog.String("account", acct),
+						slog.String("error", err.Error()))
+					break
+				}
+
+				for _, commonPrefix := range page.CommonPrefixes {
+					parts := strings.Split(aws.ToString(commonPrefix.Prefix), "/")
+					for i, part := range parts {
+						if part == "CloudTrail" && i+1 < len(parts) {
+							region := parts[i+1]
+							if region != "" {
+								mu.Lock()
+								pairs = append(pairs, AccountRegionPair{
+									AccountID: acct,
+									Region:    region,
+								})
+								mu.Unlock()
+							}
+							break
 						}
-						break
 					}
 				}
 			}
-		}
+		}(accountID)
 	}
+	wg.Wait()
 
-	regions := make([]string, 0, len(regionMap))
-	for region := range regionMap {
-		regions = append(regions, region)
-	}
-
-	if len(regions) == 0 {
-		p.logger.Warn("no regions discovered, defaulting to us-east-1")
-		regions = []string{"us-east-1"}
-	}
-
-	return regions
+	return pairs
 }
 
 func (p *Processor) processAccountRegion(ctx context.Context, bucket, basePrefix, accountID, region, orgID string) {
-	stateKey := fmt.Sprintf("%s:%s", accountID, region)
+	stateKey := fmt.Sprintf("%s:%s:%s", bucket, accountID, region)
 
 	// Check for resumption state
-	lastKey, err := p.stateDB.GetLastProcessedKey(accountID, region)
+	lastKey, err := p.stateDB.GetLastProcessedKey(bucket, accountID, region)
 	if err != nil {
 		p.logger.Error("failed to get last processed key",
 			slog.String("state_key", stateKey),
@@ -163,6 +173,7 @@ func (p *Processor) processAccountRegion(ctx context.Context, bucket, basePrefix
 	}
 
 	filesListed := 0
+	var lastSeenKey string
 	paginator := s3.NewListObjectsV2Paginator(p.s3Client, input)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
@@ -183,6 +194,7 @@ func (p *Processor) processAccountRegion(ctx context.Context, bucket, basePrefix
 
 			p.stats.FilesListed.Add(1)
 			filesListed++
+			lastSeenKey = key
 
 			p.downloadJobs <- DownloadJob{
 				Bucket:       bucket,
@@ -193,7 +205,7 @@ func (p *Processor) processAccountRegion(ctx context.Context, bucket, basePrefix
 
 			// Periodically save progress
 			if filesListed%100 == 0 {
-				if err := p.stateDB.UpdateLastProcessedKey(accountID, region, key); err != nil {
+				if err := p.stateDB.UpdateLastProcessedKey(bucket, accountID, region, key); err != nil {
 					p.logger.Error("failed to update state",
 						slog.String("state_key", stateKey),
 						slog.String("error", err.Error()))
@@ -202,7 +214,13 @@ func (p *Processor) processAccountRegion(ctx context.Context, bucket, basePrefix
 		}
 	}
 
+	// Save final state (critical for account/regions with < 100 files)
 	if filesListed > 0 {
+		if err := p.stateDB.UpdateLastProcessedKey(bucket, accountID, region, lastSeenKey); err != nil {
+			p.logger.Error("failed to save final state",
+				slog.String("state_key", stateKey),
+				slog.String("error", err.Error()))
+		}
 		p.logger.Info("enqueued files",
 			slog.String("state_key", stateKey),
 			slog.Int("count", filesListed))

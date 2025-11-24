@@ -1,3 +1,4 @@
 state.db
 events/
 bloom.gob
+config.json

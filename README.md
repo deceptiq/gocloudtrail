@@ -1,39 +1,100 @@
 # gocloudtrail
 
-Downloads and deduplicates AWS CloudTrail logs into JSONL files.
+Sync AWS CloudTrail logs from S3 to local JSONL files. Handles deduplication, resumption, and parallel processing across accounts/regions.
 
-## Usage
+## Features
 
-Requires AWS credentials with `cloudtrail:DescribeTrails`, `s3:ListBucket`, `s3:GetObject`
+- Generate config from CloudTrail API or specify trails manually
+- SQLite state tracking - resume from where you left off
+- Bloom filter deduplication across multiple trails
+- Parallel processing per account/region
+- S3 Delimiter discovery - only checks regions with actual data
 
-## Algorithm
+## Installation
 
-**Discovery:**
+```bash
+go install github.com/deceptiq/gocloudtrail@latest
+```
 
-1. Call `DescribeTrails` to find all CloudTrail trails
-2. For each trail, list S3 bucket prefixes to discover accounts (including AWS Organizations)
-3. For each account, discover regions by listing `AWSLogs/{account}/CloudTrail/{region}/` prefixes
+## Quick Start
 
-**Processing:**
+Generate config from existing CloudTrail trails:
 
-1. For each account/region pair, check SQLite `state.db` for last processed S3 key
-2. List S3 objects starting after last processed key (resumable)
-3. Queue `.json.gz` files for download (50 concurrent workers)
-4. Download, decompress, parse CloudTrail events
-5. For each event, check bloom filter by `eventID` to skip duplicates
-6. Write new events to JSONL files organized by `{account}/{region}/{YYYY}/{MM}/{DD}/{HH}/events_NNNNN.jsonl`
-7. Every 100 files, update SQLite with current S3 key for resumption
+```bash
+gocloudtrail generate-config config.json
+```
 
-**State:**
+Run the processor:
 
-- `state.db` - SQLite table tracking `(account_id, region) -> last_processed_key`
-- `bloom.gob` - Bloom filter of seen `eventID`s
-
-**Running**
-
-- Interrupt with Ctrl+C to stop gracefully.
-- Restart to resume from last checkpoint.
+```bash
+gocloudtrail run -config config.json
+```
 
 ## Configuration
 
-Edit constants in `cmd/poller/main.go` for workers, batch sizes, and bloom filter capacity. All other information such as organization trail details will be auto-discovered.
+Generate config automatically or create it manually. Example:
+
+```json
+{
+  "download_workers": 50, // parallel downloads (I/O bound)
+  "process_workers": 0, // parallel processing (CPU bound, 0 = auto 2*CPUs)
+  "download_queue_size": 5000, // download queue depth
+  "process_queue_size": 2000, // processing queue depth
+  "list_batch_size": 1000, // S3 ListObjects batch size
+  "events_per_file": 10000, // events per output JSONL file
+
+  "state_db": "state.db", // SQLite resumption state
+  "bloom_file": "bloom.gob", // bloom filter for deduplication
+  "events_dir": "events", // output directory
+
+  "bloom_expected_items": 100000000, // expected total events
+  "bloom_false_positive": 0.001, // bloom filter false positive rate
+
+  "state_save_interval": 300, // save state every N seconds
+  "progress_interval": 10, // print progress every N seconds
+  "jsonl_flush_interval": 30, // flush JSONL buffers every N seconds
+
+  "max_idle_conns": 500, // HTTP connection pool settings
+  "max_idle_conns_per_host": 500,
+  "max_conns_per_host": 500,
+  "idle_conn_timeout": 90,
+  "dial_timeout": 10,
+  "keep_alive": 30,
+  "client_timeout": 60,
+
+  "trails": [
+    {
+      "name": "my-trail",
+      "bucket": "my-cloudtrail-bucket",
+      "prefix": "optional-prefix"
+    }
+  ]
+}
+```
+
+## How It Works
+
+1. Uses S3 Delimiter to find which account/region combinations have data
+2. Tracks last processed S3 key per (bucket, account, region) in SQLite
+3. Parallel workers download and decompress .json.gz files
+4. Bloom filter checks event IDs to skip duplicates across trails
+5. Writes JSONL files organized by account/region/date
+
+State checkpoints every 100 files. Hit Ctrl+C to stop gracefully, then restart with the same config to resume.
+
+## Permissions
+
+Need `s3:ListBucket` and `s3:GetObject` on the CloudTrail bucket(s). Add `cloudtrail:DescribeTrails` if using `generate-config`.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetObject"],
+      "Resource": "*"
+    }
+  ]
+}
+```

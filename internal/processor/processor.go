@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/deceptiq/gocloudtrail/internal/bloom"
+	"github.com/deceptiq/gocloudtrail/internal/config"
 	"github.com/deceptiq/gocloudtrail/internal/state"
 	"github.com/deceptiq/gocloudtrail/internal/writer"
 )
@@ -25,6 +26,7 @@ type Config struct {
 	ListBatchSize     int
 	EventsPerFile     int
 	EventsDir         string
+	Trails            []config.Trail
 }
 
 type Processor struct {
@@ -126,7 +128,25 @@ func (p *Processor) Stats() *Stats {
 }
 
 func (p *Processor) discoverAndProcess(ctx context.Context) error {
-	p.logger.Info("discovering CloudTrail trails")
+	// If trails are provided in config, use those instead of API discovery
+	if len(p.config.Trails) > 0 {
+		p.logger.Info("processing trails from config", slog.Int("count", len(p.config.Trails)))
+
+		var wg sync.WaitGroup
+		for _, trail := range p.config.Trails {
+			wg.Add(1)
+			go func(t config.Trail) {
+				defer wg.Done()
+				p.processConfigTrail(ctx, t)
+			}(trail)
+		}
+
+		wg.Wait()
+		return nil
+	}
+
+	// Fall back to API discovery
+	p.logger.Info("discovering CloudTrail trails via API")
 
 	resp, err := p.ctClient.DescribeTrails(ctx, &cloudtrail.DescribeTrailsInput{})
 	if err != nil {
@@ -146,6 +166,53 @@ func (p *Processor) discoverAndProcess(ctx context.Context) error {
 
 	wg.Wait()
 	return nil
+}
+
+func (p *Processor) processConfigTrail(ctx context.Context, trail config.Trail) {
+	trailName := trail.Name
+	bucketName := trail.Bucket
+	prefix := trail.Prefix
+
+	p.logger.Info("processing trail",
+		slog.String("trail", trailName),
+		slog.String("bucket", bucketName),
+		slog.String("prefix", prefix))
+
+	basePrefix := ""
+	if prefix != "" {
+		basePrefix = prefix + "/"
+	}
+	basePrefix += "AWSLogs/"
+
+	// discover accounts
+	accounts, orgID := p.discoverAccounts(ctx, bucketName, basePrefix)
+	if orgID != "" {
+		p.logger.Info("AWS Organization detected",
+			slog.String("trail", trailName),
+			slog.String("org_id", orgID))
+	}
+	p.logger.Info("discovered accounts",
+		slog.String("trail", trailName),
+		slog.Int("count", len(accounts)))
+
+	// discover account/region pairs that actually have data
+	pairs := p.discoverAccountRegions(ctx, bucketName, basePrefix, accounts, orgID)
+	p.logger.Info("discovered account/region combinations with data",
+		slog.String("trail", trailName),
+		slog.Int("count", len(pairs)))
+
+	// process only the account/region pairs that have data
+	var wg sync.WaitGroup
+	for _, pair := range pairs {
+		wg.Add(1)
+		go func(pr AccountRegionPair) {
+			defer wg.Done()
+			p.processAccountRegion(ctx, bucketName, basePrefix, pr.AccountID, pr.Region, orgID)
+		}(pair)
+	}
+	wg.Wait()
+
+	p.logger.Info("finished processing trail", slog.String("trail", trailName))
 }
 
 func (p *Processor) processTrail(ctx context.Context, trail types.Trail) {
@@ -175,22 +242,20 @@ func (p *Processor) processTrail(ctx context.Context, trail types.Trail) {
 		slog.String("trail", trailName),
 		slog.Int("count", len(accounts)))
 
-	// discover regions
-	regions := p.discoverRegions(ctx, bucketName, basePrefix, accounts, orgID)
-	p.logger.Info("discovered regions",
+	// discover account/region pairs that actually have data
+	pairs := p.discoverAccountRegions(ctx, bucketName, basePrefix, accounts, orgID)
+	p.logger.Info("discovered account/region combinations with data",
 		slog.String("trail", trailName),
-		slog.Int("count", len(regions)))
+		slog.Int("count", len(pairs)))
 
-	// process each account/region
+	// process only the account/region pairs that have data
 	var wg sync.WaitGroup
-	for _, accountID := range accounts {
-		for _, region := range regions {
-			wg.Add(1)
-			go func(acct, reg string) {
-				defer wg.Done()
-				p.processAccountRegion(ctx, bucketName, basePrefix, acct, reg, orgID)
-			}(accountID, region)
-		}
+	for _, pair := range pairs {
+		wg.Add(1)
+		go func(pr AccountRegionPair) {
+			defer wg.Done()
+			p.processAccountRegion(ctx, bucketName, basePrefix, pr.AccountID, pr.Region, orgID)
+		}(pair)
 	}
 	wg.Wait()
 
